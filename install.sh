@@ -1,25 +1,23 @@
 #!/bin/bash
 set -e
 
-# --------------------------
-# CaveFiltering Installer
-# --------------------------
+# CaveFiltering Installer (default: system-wide with --break-system-packages)
 
 if [ "$EUID" -ne 0 ]; then
-    echo "Please run as root: sudo bash install.sh [--break-system-packages]"
+    echo "Run as root: sudo bash install.sh [--use-venv]"
     exit 1
 fi
 
-MODE="venv"   # default: virtual environment
-if [ "$1" == "--break-system-packages" ]; then
-    MODE="system"
-    echo "⚠️  WARNING: Installing system‑wide with --break-system-packages"
-    echo "   This may break your OS Python environment."
-    echo "   Press Ctrl+C within 5 seconds to cancel..."
-    sleep 5
+USE_VENV=false
+if [ "$1" == "--use-venv" ]; then
+    USE_VENV=true
+    echo "==> Using Python virtual environment"
+else
+    echo "==> Installing system-wide (--break-system-packages)"
+    sleep 2
 fi
 
-# ---------- OS detection & dependencies ----------
+# OS detection
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS=$ID
@@ -31,8 +29,7 @@ fi
 echo "==> Installing system packages..."
 if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     apt update
-    apt install -y \
-        clang llvm libbpf-dev linux-headers-$(uname -r) \
+    apt install -y clang llvm libbpf-dev linux-headers-$(uname -r) \
         build-essential python3-pip python3-venv \
         python3-bpfcc bpfcc-tools \
         redis-server iptables ipset net-tools
@@ -44,35 +41,34 @@ else
     exit 1
 fi
 
-# ---------- Prepare target directory ----------
+# Prepare target directory
 mkdir -p /opt/cavefilter/config /opt/cavefilter/src/dashboard/templates
 
-# Copy project files (assumes you are in repo root)
+# Copy project files (from current directory, assumed to be repo root)
 cp config/cavefilter.conf /opt/cavefilter/config/
 cp src/cavefilter.c /opt/cavefilter/src/
 cp src/cavefilter.py /opt/cavefilter/src/
 cp src/dashboard/app.py /opt/cavefilter/src/dashboard/
 cp src/dashboard/templates/index.html /opt/cavefilter/src/dashboard/templates/
 
-# ---------- Python environment ----------
-if [ "$MODE" = "venv" ]; then
-    echo "==> Creating virtual environment..."
+# Python setup
+if [ "$USE_VENV" = true ]; then
     python3 -m venv /opt/cavefilter/venv
     PYTHON_BIN="/opt/cavefilter/venv/bin/python"
     PIP_BIN="/opt/cavefilter/venv/bin/pip"
+    PIP_EXTRA=""
 else
     PYTHON_BIN="/usr/bin/python3"
     PIP_BIN="pip3"
+    PIP_EXTRA="--break-system-packages"
 fi
 
 echo "==> Installing Python dependencies..."
-$PIP_BIN install $([ "$MODE" = "system" ] && echo "--break-system-packages") \
-    flask flask-socketio redis psutil gevent gevent-websocket
+$PIP_BIN install $PIP_EXTRA flask flask-socketio redis psutil gevent gevent-websocket
 
-# ---------- Create systemd units (dynamic) ----------
-echo "==> Setting up systemd services..."
+# Create systemd services dynamically
+echo "==> Creating systemd units..."
 
-# cavefilter.service
 cat > /etc/systemd/system/cavefilter.service <<EOF
 [Unit]
 Description=CaveFiltering XDP DDoS Shield Daemon
@@ -90,7 +86,6 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=multi-user.target
 EOF
 
-# cavefilter-dash.service
 cat > /etc/systemd/system/cavefilter-dash.service <<EOF
 [Unit]
 Description=CaveFiltering Web Dashboard
@@ -107,12 +102,12 @@ StandardOutput=journal
 WantedBy=multi-user.target
 EOF
 
-# ---------- Enable & start ----------
+# Reload and start
 systemctl daemon-reload
 systemctl enable redis-server
 systemctl start redis-server
 
-echo "==> Starting CaveFiltering services..."
+echo "==> Starting CaveFiltering..."
 systemctl enable cavefilter
 systemctl start cavefilter
 systemctl enable cavefilter-dash
@@ -120,7 +115,7 @@ systemctl start cavefilter-dash
 
 echo ""
 echo "======================================"
-echo " CaveFiltering installed successfully!"
+echo " CaveFiltering installed!"
 echo " Dashboard: http://$(hostname -I | awk '{print $1}'):5000"
-echo " Python mode: $MODE"
+echo " Python mode: $([ "$USE_VENV" = true ] && echo 'venv' || echo 'system')"
 echo "======================================"
