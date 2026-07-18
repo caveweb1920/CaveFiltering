@@ -1,0 +1,13 @@
+[Unit]
+Description=CaveFiltering Web Dashboard
+After=network.target cavefilter.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/cavefilter/src/dashboard/app.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target
