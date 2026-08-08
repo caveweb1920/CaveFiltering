@@ -18,7 +18,8 @@ def load_config():
         "network": {"interface": "eth0"},
         "xdp_mode": {"mode": "0"},
         "ban": {"duration": "3600"},
-        "dashboard": {"bind": "127.0.0.1", "port": "5000"}
+        "dashboard": {"bind": "127.0.0.1", "port": "5000"},
+        "detection": {"port_scan_threshold": "20", "port_scan_window": "60"}
     }
     for section, pairs in defaults.items():
         if section not in cfg:
@@ -27,11 +28,13 @@ def load_config():
             cfg[section].setdefault(k, v)
     return cfg
 
+
 def ip_to_int(ip_str):
     try:
         return struct.unpack("!I", socket.inet_aton(ip_str))[0]
     except Exception:
         return None
+
 
 def int_to_ip(ip_int):
     return socket.inet_ntoa(struct.pack("!I", ip_int))
@@ -51,10 +54,15 @@ class CaveDaemon:
         except Exception as e:
             logging.warning("Redis init failed: %s", e)
             self.r = None
+
+        # detection settings
+        self.port_scan_threshold = int(self.cfg.get("detection", {}).get("port_scan_threshold", "20"))
+        self.port_scan_window = int(self.cfg.get("detection", {}).get("port_scan_window", "60"))
+
         # ensure ipset exists (idempotent)
         duration = str(self.cfg["ban"]["duration"])
         try:
-            subprocess.run(["ipset", "-exist", "create", "cave_blacklist", "hash:ip", "timeout", duration], check=False)
+            subprocess.run(["ipset", "create", "cave_blacklist", "hash:ip", "timeout", duration, "-exist"], check=False)
         except Exception as e:
             logging.warning("ipset create failed (nonfatal): %s", e)
         # ensure iptables rule exists (check then insert)
@@ -76,34 +84,66 @@ class CaveDaemon:
         self.b = BPF(src_file=bpf_path)
         self.fn = self.b.load_func("cavefilter", BPF.XDP)
         self.b.attach_xdp(self.iface, self.fn, self.xdp_mode)
-        self.b["block_events"].open_perf_buffer(self._handle_event, page_cnt=64)
+        # register perf buffers
+        self.b["block_events"].open_perf_buffer(self._handle_block_event, page_cnt=64)
+        self.b["port_events"].open_perf_buffer(self._handle_port_event, page_cnt=256)
         logging.info("XDP attached to %s", self.iface)
 
-    def _handle_event(self, cpu, data, size):
+    def ban_ip(self, ip_str, reason_code=0):
+        ip_int = ip_to_int(ip_str)
+        if ip_int is None:
+            logging.warning("ban_ip: invalid ip %s", ip_str)
+            return
+        # update BPF blacklist map
+        try:
+            self.b["blacklist"][ip_int] = 1
+        except Exception:
+            pass
+        # add to ipset
+        subprocess.run(["ipset", "add", "cave_blacklist", ip_str], check=False)
+        # record in Redis
+        try:
+            if self.r:
+                self.r.hset("banned_ips", ip_str, json.dumps({"time": time.time(), "reason": str(reason_code)}))
+        except Exception as e:
+            logging.warning("Redis hset failed: %s", e)
+        logging.info("Banned %s (reason=%s)", ip_str, reason_code)
+
+    def _handle_block_event(self, cpu, data, size):
         try:
             event = self.b["block_events"].event(data)
             ip_int = event.src_ip
             reason = int(event.reason)
             ip_str = int_to_ip(ip_int)
-            # add to BPF blacklist map (idempotent)
-            try:
-                self.b["blacklist"][ip_int] = 1
-            except Exception:
-                pass
-            # add to ipset (ignore failures)
-            subprocess.run(["ipset", "add", "cave_blacklist", ip_str], check=False)
-            # record in Redis
-            try:
-                if self.r:
-                    self.r.hset("banned_ips", ip_str, json.dumps({
-                        "time": time.time(),
-                        "reason": {1:"SYN flood",2:"Handshake flood",3:"DNS flood",4:"SSH brute"}.get(reason,"Unknown")
-                    }))
-            except Exception as e:
-                logging.warning("Redis hset failed: %s", e)
-            logging.info("Banned %s - reason=%s", ip_str, reason)
+            # add to ipset and redis
+            self.ban_ip(ip_str, reason)
         except Exception as e:
-            logging.exception("Error handling perf event: %s", e)
+            logging.exception("Error handling block event: %s", e)
+
+    def _handle_port_event(self, cpu, data, size):
+        try:
+            event = self.b["port_events"].event(data)
+            ip_int = event.src_ip
+            dport = socket.ntohs(event.dport)
+            ip_str = int_to_ip(ip_int)
+            # track distinct destination ports per source using Redis set
+            if not self.r:
+                return
+            key = f"ports:{ip_str}"
+            try:
+                self.r.sadd(key, str(dport))
+                self.r.expire(key, self.port_scan_window)
+                count = self.r.scard(key)
+                if count >= self.port_scan_threshold:
+                    logging.info("Port-scan detected %s (%d ports) — banning", ip_str, count)
+                    # ban with reason 5 (port-scan)
+                    self.ban_ip(ip_str, 5)
+                    # clear the set
+                    self.r.delete(key)
+            except Exception as e:
+                logging.warning("Redis error in port_event handler: %s", e)
+        except Exception as e:
+            logging.exception("Error handling port event: %s", e)
 
     def process_unban_queue(self):
         while True:
